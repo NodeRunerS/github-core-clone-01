@@ -14,6 +14,8 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
+// Entry: github-core-clone-01 — this lifecycle file is the kit starter's, kept as-is;
+// the forge itself (git smart HTTP, REST v3, GraphQL v4, MCP) lives in app.ts and its modules.
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
 import { createApp } from './app.ts';
