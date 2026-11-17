@@ -50,6 +50,8 @@ export interface Issue {
   comments: Comment[];
   /** Cached JSON.stringify of the REST issue object; cleared on any mutation. */
   jsonCache: string | null;
+  /** Cached full response bytes (jsonCache + '\n'); cleared with jsonCache. */
+  jsonCacheBuf: Buffer | null;
 }
 
 export interface Comment {
@@ -85,6 +87,16 @@ export interface Label {
   color: string;
 }
 
+export interface FetchSelection {
+  oids: string[];
+  shallow: string[];
+  unshallow: string[];
+  acks: string[];
+  nak: boolean;
+  ready: boolean;
+  wantedRefs: Array<{ oid: string; ref: string }>;
+}
+
 export interface Repo {
   id: number;
   name: string;
@@ -98,9 +110,13 @@ export interface Repo {
   objects: Map<string, GitObject>;
   commitCache: Map<string, ParsedCommit>;
   fileMapCache: Map<string, Map<string, { oid: string; mode: string }>>;
+  /** Parsed trees, cached per oid (tree objects are immutable). */
+  treeCache: Map<string, TreeEntry[]>;
   packEntryCache: Map<string, Buffer>;
   /** Whole pack bytes for a fetch selection, keyed by the selection's inputs. */
   packCache: Map<string, Buffer>;
+  /** Fetch selections, keyed by selection inputs + object count + refs fingerprint. */
+  fetchSelCache: Map<string, FetchSelection>;
   issues: Issue[];
   issueByNumber: Map<number, Issue>;
   pulls: Pull[];
@@ -118,8 +134,8 @@ export function sha1(data: Buffer): string {
 }
 
 export function objectId(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([header, data]));
+  // Two-part hash update: no Buffer.concat copy of the object data.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 
 export function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
@@ -180,6 +196,16 @@ export function parseTree(data: Buffer): TreeEntry[] {
   return entries;
 }
 
+/** Parse a tree object, cached per repo (trees are immutable). */
+export function cachedParseTree(repo: Repo, oid: string): TreeEntry[] {
+  const cached = repo.treeCache.get(oid);
+  if (cached) return cached;
+  const obj = repo.objects.get(oid);
+  const entries = obj && obj.type === 'tree' ? parseTree(obj.data) : [];
+  repo.treeCache.set(oid, entries);
+  return entries;
+}
+
 function gitSortKey(name: string, isDir: boolean): string {
   return isDir ? `${name}/` : name;
 }
@@ -231,9 +257,7 @@ export function fileMapOf(repo: Repo, commitOid: string): Map<string, { oid: str
   const commit = getCommit(repo, commitOid);
   if (commit) {
     const walk = (treeOid: string, prefix: string): void => {
-      const obj = repo.objects.get(treeOid);
-      if (!obj || obj.type !== 'tree') return;
-      for (const entry of parseTree(obj.data)) {
+      for (const entry of cachedParseTree(repo, treeOid)) {
         const path = prefix ? `${prefix}/${entry.name}` : entry.name;
         if (entry.mode === '40000') walk(entry.oid, path);
         else out.set(path, { oid: entry.oid, mode: entry.mode });
@@ -277,10 +301,22 @@ export function reachableCommits(repo: Repo, tips: readonly string[]): Set<strin
   return seen;
 }
 
-/** Is `ancestor` an ancestor of (or equal to) `oid`? */
+/** Is `ancestor` an ancestor of (or equal to) `oid`? Bounded walk from the tip: a normal
+ *  fast-forward push finds its parent in one step instead of building the whole history set. */
 export function isAncestor(repo: Repo, ancestor: string, oid: string): boolean {
   if (ancestor === oid) return true;
-  return reachableCommits(repo, [oid]).has(ancestor);
+  const seen = new Set<string>();
+  const stack = [oid];
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    if (cur === ancestor) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const commit = getCommit(repo, cur);
+    if (!commit) continue;
+    for (const parent of commit.parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** History of a branch tip, newest first (by time, then insertion order). */
@@ -364,8 +400,10 @@ export class Store {
       objects: new Map(),
       commitCache: new Map(),
       fileMapCache: new Map(),
+      treeCache: new Map(),
       packEntryCache: new Map(),
       packCache: new Map(),
+      fetchSelCache: new Map(),
       issues: [],
       issueByNumber: new Map(),
       pulls: [],
@@ -416,6 +454,7 @@ export class Store {
       userLogin: VIEWER_LOGIN,
       comments: [],
       jsonCache: null,
+      jsonCacheBuf: null,
     };
     this.nextGlobalId += 1;
     repo.nextIssue += 1;
@@ -473,6 +512,7 @@ export class Store {
     this.nextGlobalId += 1;
     issue.comments.push(comment);
     issue.jsonCache = null;
+    issue.jsonCacheBuf = null;
     this.commentById.set(comment.id, { repo, issue, comment });
     return comment;
   }

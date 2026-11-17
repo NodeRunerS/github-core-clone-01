@@ -2,11 +2,11 @@
 // pkt-lines and side-band-64k. Node stdlib only; no git binary.
 
 import { createHash } from 'node:crypto';
-import { createInflate } from 'node:zlib';
+import { createInflate, inflateSync } from 'node:zlib';
 import {
   ZERO_OID, VIEWER_NAME, VIEWER_EMAIL,
-  type GitObject, type ObjType, type Repo,
-  sha1, storeObject, getCommit, parseTree, buildTree, fileMapOf,
+  type FetchSelection, type GitObject, type ObjType, type Repo,
+  sha1, storeObject, getCommit, cachedParseTree, buildTree, fileMapOf,
   reachableCommits, isAncestor, packEntry,
 } from './store.ts';
 
@@ -79,6 +79,58 @@ function inflateOne(input: Buffer): Promise<{ data: Buffer; consumed: number }> 
     inf.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: inf.bytesWritten }));
     inf.end(input);
   });
+}
+
+/** Adler-32 (the checksum trailing every zlib stream) of `data`. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate one pack entry synchronously. inflateSync is ~20x faster than a per-object stream,
+ * but reports no consumed length: the stream's end is found by scanning for its trailing
+ * Adler-32 (a zlib stream is header + deflate + Adler-32 of the data), and the candidate end
+ * is verified by re-inflating exactly that slice. Returns null when anything is unexpected,
+ * and the caller falls back to the stream version.
+ */
+function inflateEntrySync(buf: Buffer, pos: number, size: number): { data: Buffer; consumed: number } | null {
+  let data: Buffer;
+  try {
+    data = inflateSync(buf.subarray(pos));
+  } catch {
+    return null;
+  }
+  if (data.length !== size) return null;
+  const adler = adler32(data);
+  const b0 = (adler >>> 24) & 0xff;
+  const b1 = (adler >>> 16) & 0xff;
+  const b2 = (adler >>> 8) & 0xff;
+  const b3 = adler & 0xff;
+  const limit = buf.length - 4;
+  for (let q = pos + 2; q <= limit; q += 1) {
+    if (buf[q] === b0 && buf[q + 1] === b1 && buf[q + 2] === b2 && buf[q + 3] === b3) {
+      // The slice must include the Adler trailer itself (q + 4), or inflateSync
+      // sees a truncated stream and throws "unexpected end of file".
+      try {
+        if (inflateSync(buf.subarray(pos, q + 4)).length === size) {
+          return { data, consumed: q + 4 - pos };
+        }
+      } catch {
+        // A truncated slice: not the true end, keep scanning.
+      }
+    }
+  }
+  return null;
+}
+
+async function inflateEntry(buf: Buffer, pos: number, size: number): Promise<{ data: Buffer; consumed: number }> {
+  return inflateEntrySync(buf, pos, size) ?? inflateOne(buf.subarray(pos));
 }
 
 interface PackEntryRaw {
@@ -184,21 +236,21 @@ export async function readPack(
         pos += 1;
         offset = ((offset + 1) << 7) | (b & 0x7f);
       }
-      const { data, consumed } = await inflateOne(buf.subarray(pos));
+      const { data, consumed } = await inflateEntry(buf, pos, size);
       if (data.length !== size) throw new Error('ofs-delta inflated size mismatch');
       pos += consumed;
       raw = { type: 'ofs-delta', data, baseOffset: entryStart - offset };
     } else if (type === 7) {
       const baseOid = buf.subarray(pos, pos + 20).toString('hex');
       pos += 20;
-      const { data, consumed } = await inflateOne(buf.subarray(pos));
+      const { data, consumed } = await inflateEntry(buf, pos, size);
       if (data.length !== size) throw new Error('ref-delta inflated size mismatch');
       pos += consumed;
       raw = { type: 'ref-delta', data, baseOid };
     } else {
       const typeName = typeNames[type];
       if (!typeName) throw new Error(`unknown pack object type ${type}`);
-      const { data, consumed } = await inflateOne(buf.subarray(pos));
+      const { data, consumed } = await inflateEntry(buf, pos, size);
       if (data.length !== size) throw new Error('object inflated size mismatch');
       pos += consumed;
       raw = { type: typeName, data };
@@ -206,8 +258,7 @@ export async function readPack(
     raws.push(raw);
   }
   const oidOf = (obj: GitObject): string => {
-    const header = Buffer.from(`${obj.type} ${obj.data.length}\0`, 'utf8');
-    return sha1(Buffer.concat([header, obj.data]));
+    return createHash('sha1').update(`${obj.type} ${obj.data.length}\0`, 'utf8').update(obj.data).digest('hex');
   };
   const resolve = (raw: PackEntryRaw): GitObject => {
     if (raw.type === 'ofs-delta' || raw.type === 'ref-delta') {
@@ -250,16 +301,6 @@ export interface FetchRequest {
   deepenNot?: string[];
   filter?: string;
   done?: boolean;
-}
-
-export interface FetchSelection {
-  oids: string[];
-  shallow: string[];
-  unshallow: string[];
-  acks: string[];
-  nak: boolean;
-  ready: boolean;
-  wantedRefs: Array<{ oid: string; ref: string }>;
 }
 
 function peelToCommit(repo: Repo, oid: string): string | null {
@@ -323,10 +364,8 @@ export function selectFetch(repo: Repo, req: FetchRequest): FetchSelection {
     const commit = getCommit(repo, oid);
     if (!commit) continue;
     const walk = (treeOid: string): void => {
-      const obj = repo.objects.get(treeOid);
-      if (!obj || obj.type !== 'tree') return;
       heldObjects.add(treeOid);
-      for (const entry of parseTree(obj.data)) {
+      for (const entry of cachedParseTree(repo, treeOid)) {
         if (entry.mode === '40000') walk(entry.oid);
         else heldObjects.add(entry.oid);
       }
@@ -336,15 +375,19 @@ export function selectFetch(repo: Repo, req: FetchRequest): FetchSelection {
 
   const included = new Set<string>();
   let maxDistance = new Map<string, number>();
+  // Reachable-from-wants, computed once and reused below (ACKs, shallow lines).
+  const reachableFromWants = reachableCommits(repo, wantCommits);
   if (req.depth !== undefined) {
-    // BFS from the wants, limited to distance < depth.
+    // BFS from the wants, limited to distance < depth (index cursor, no shift()).
     const dist = new Map<string, number>();
     const queue: string[] = [];
+    let head = 0;
     for (const tip of wantCommits) {
       if (!dist.has(tip)) { dist.set(tip, 0); queue.push(tip); }
     }
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    while (head < queue.length) {
+      const oid = queue[head] as string;
+      head += 1;
       const d = dist.get(oid) as number;
       if (d >= (req.depth as number)) continue;
       if (!recentEnough(oid)) continue;
@@ -359,8 +402,7 @@ export function selectFetch(repo: Repo, req: FetchRequest): FetchSelection {
     // Never re-send a commit the client already holds.
     for (const oid of held) included.delete(oid);
   } else {
-    const reachable = reachableCommits(repo, wantCommits);
-    for (const oid of reachable) {
+    for (const oid of reachableFromWants) {
       if (!held.has(oid) && recentEnough(oid)) included.add(oid);
     }
   }
@@ -375,7 +417,6 @@ export function selectFetch(repo: Repo, req: FetchRequest): FetchSelection {
   };
   const shallowOut = new Set<string>();
   const unshallowOut = new Set<string>();
-  const reachableFromWants = reachableCommits(repo, wantCommits);
   for (const s of shallowSet) {
     if (!reachableFromWants.has(s)) continue;
     if (parentsPresent(s)) unshallowOut.add(s);
@@ -418,10 +459,8 @@ export function selectFetch(repo: Repo, req: FetchRequest): FetchSelection {
     const commit = getCommit(repo, oid);
     if (!commit) continue;
     const walk = (treeOid: string): void => {
-      const obj = repo.objects.get(treeOid);
-      if (!obj || obj.type !== 'tree') return;
       if (!skipTrees) add(treeOid);
-      for (const entry of parseTree(obj.data)) {
+      for (const entry of cachedParseTree(repo, treeOid)) {
         if (entry.mode === '40000') walk(entry.oid);
         else {
           const blob = repo.objects.get(entry.oid);
@@ -514,19 +553,21 @@ export function infoRefsBody(repo: Repo | null, service: 'git-upload-pack' | 'gi
   if (!repo) return null;
   const serviceLine = pktStr(`# service=${service}\n`);
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
-    const caps = [
-      'version 2',
-      `agent=${AGENT}`,
-      'ls-refs=unborn',
-      'fetch=shallow filter',
-      'object-format=sha1',
-      'server-option',
-    ];
-    return Buffer.concat([serviceLine, FLUSH, ...caps.map((c) => pktStr(`${c}\n`)), FLUSH]);
+    // The v2 capability advertisement is constant: build once.
+    return Buffer.concat([serviceLine, FLUSH, V2_UPLOAD_CAPS, FLUSH]);
   }
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
   return Buffer.concat([serviceLine, FLUSH, ...refLinesV0(repo, caps, true), FLUSH]);
 }
+
+const V2_UPLOAD_CAPS = Buffer.concat([
+  'version 2',
+  `agent=${AGENT}`,
+  'ls-refs=unborn',
+  'fetch=shallow filter',
+  'object-format=sha1',
+  'server-option',
+].map((c) => pktStr(`${c}\n`)));
 
 // --------------------------------------------------------------------------------------------
 // upload-pack.
@@ -579,9 +620,8 @@ export function handleUploadPack(repo: Repo, body: Buffer, gitProtocol: string):
   const isV2 = gitProtocol === 'version=2';
   const req = isV2 ? parseFetchRequestV2(body) : parseFetchRequestV0(body);
   if (!req) return null;
-  const sel = selectFetch(repo, req);
-  // The pack for a selection is a pure function of the reachable object graph, which only
-  // grows: cache the bytes so repeated identical fetches (the clone workload) are a lookup.
+  // The selection is a pure function of the request and the repo state (objects only grow,
+  // refs are fingerprinted): repeated identical fetches (the clone workload) are a lookup.
   const packKey = JSON.stringify([
     [...req.wants].sort(),
     [...req.haves].sort(),
@@ -591,6 +631,17 @@ export function handleUploadPack(repo: Repo, body: Buffer, gitProtocol: string):
     [...(req.deepenNot ?? [])].sort(),
     req.filter ?? '',
   ]);
+  let refsFp = refsFingerprint(repo);
+  const selKey = `${packKey}|${repo.objects.size}|${refsFp}`;
+  let sel = repo.fetchSelCache.get(selKey);
+  if (sel === undefined) {
+    sel = selectFetch(repo, req);
+    repo.fetchSelCache.set(selKey, sel);
+    if (repo.fetchSelCache.size > 8) {
+      const first = repo.fetchSelCache.keys().next().value;
+      if (first !== undefined) repo.fetchSelCache.delete(first);
+    }
+  }
   let pack = repo.packCache.get(packKey);
   if (pack === undefined) {
     pack = writePack(repo, sel.oids);
@@ -658,6 +709,39 @@ export function handleLsRefs(repo: Repo, body: Buffer): Buffer | null {
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice(11));
   }
   if (!sawCommand) return null;
+  // The answer depends only on the args and the refs: cache it per repo state
+  // (the clone workload issues the same ls-refs 50x per round).
+  const cacheKey = `${JSON.stringify([peel, symrefs, unborn, prefixes])}|${refsFingerprint(repo)}`;
+  const cached = lsRefsCacheFor(repo).get(cacheKey);
+  if (cached !== undefined) return cached;
+  const out = buildLsRefs(repo, peel, symrefs, unborn, prefixes);
+  const cache = lsRefsCacheFor(repo);
+  cache.set(cacheKey, out);
+  if (cache.size > 8) {
+    const first = cache.keys().next().value;
+    if (first !== undefined) cache.delete(first);
+  }
+  return out;
+}
+
+const lsRefsCaches = new WeakMap<Repo, Map<string, Buffer>>();
+
+function lsRefsCacheFor(repo: Repo): Map<string, Buffer> {
+  let cache = lsRefsCaches.get(repo);
+  if (!cache) {
+    cache = new Map();
+    lsRefsCaches.set(repo, cache);
+  }
+  return cache;
+}
+
+function refsFingerprint(repo: Repo): string {
+  let fp = '';
+  for (const [name, oid] of repo.refs) fp += `${name}=${oid};`;
+  return fp;
+}
+
+function buildLsRefs(repo: Repo, peel: boolean, symrefs: boolean, unborn: boolean, prefixes: string[]): Buffer {
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   const out: Buffer[] = [];
   const head = repo.refs.get('refs/heads/main');

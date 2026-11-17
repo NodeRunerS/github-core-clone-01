@@ -2,11 +2,10 @@
 // and git smart HTTP under /{owner}/{repo}.git. Node stdlib only; one in-memory Store.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
 import {
   VIEWER_LOGIN, VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL, ZERO_OID, DEFAULT_BRANCH,
   Store, type Repo, type Issue, type Pull,
-  gid, isoNow, storeObject, getCommit, parseTree, buildTree, fileMapOf,
+  gid, isoNow, storeObject, getCommit, cachedParseTree, buildTree, fileMapOf,
   commitHistory, diffFiles, prMergeable, squashMerge, createCommit,
 } from './store.ts';
 import { infoRefsBody, handleUploadPack, handleLsRefs, handleReceivePack } from './git.ts';
@@ -15,18 +14,23 @@ import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const EXPECTED_AUTH = `Bearer ${SHOP_TOKEN}`;
+
+/** Monotonic request ids: crypto randomBytes per response showed up in profiles. */
+let requestCounter = 0;
 
 const store = new Store();
 
 function requestId(): string {
-  return `req_${randomBytes(8).toString('hex')}`;
+  requestCounter += 1;
+  return `req_${requestCounter.toString(16).padStart(16, '0')}`;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const text = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': text.length,
     'x-github-request-id': requestId(),
     ...headers,
   });
@@ -35,10 +39,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 
 /** Send an already-stringified JSON body (the trailing newline is added here). */
 function sendJsonText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
-  const body = `${text}\n`;
+  const body = Buffer.from(`${text}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(body),
+    'content-length': body.length,
     'x-github-request-id': requestId(),
     ...headers,
   });
@@ -76,22 +80,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
-}
-
 function decodeSegment(s: string): string {
   try {
     return decodeURIComponent(s);
@@ -101,15 +89,15 @@ function decodeSegment(s: string): string {
 }
 
 function segments(path: string): string[] {
-  return path.split('/').filter((s) => s !== '').map(decodeSegment);
+  return path.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeSegment(s) : s));
 }
 
 /** Bearer auth: the shop token when the env sets one, else any non-empty bearer token. */
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
+  if (SHOP_TOKEN !== '') return header === EXPECTED_AUTH;
   const m = /^Bearer (.+)$/.exec(header);
   if (!m) return false;
-  if (SHOP_TOKEN !== '') return m[1] === SHOP_TOKEN;
   return m[1].length > 0;
 }
 
@@ -202,6 +190,14 @@ function issueJsonText(repo: Repo, issue: Issue): string {
   const text = JSON.stringify(issueJson(repo, issue));
   issue.jsonCache = text;
   return text;
+}
+
+/** Full cached response bytes for GET single-issue (jsonCache + '\n'). */
+function issueResponseBuffer(repo: Repo, issue: Issue): Buffer {
+  if (issue.jsonCacheBuf !== null) return issue.jsonCacheBuf;
+  const buf = Buffer.from(`${issueJsonText(repo, issue)}\n`, 'utf8');
+  issue.jsonCacheBuf = buf;
+  return buf;
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: Issue['comments'][number]): Record<string, unknown> {
@@ -331,8 +327,8 @@ async function handleContents(
   repo: Repo,
   pathParts: string[],
   method: string,
+  query: URLSearchParams,
 ): Promise<void> {
-  const query = queryOf(req);
   const path = pathParts.join('/');
   if (method === 'GET') {
     const tip = branchTip(repo, query.get('ref'));
@@ -489,9 +485,7 @@ function dirTreeOid(repo: Repo, tip: string, dir: string): string {
   const parts = dir.split('/');
   let treeOid = commit.tree;
   for (const part of parts) {
-    const obj = repo.objects.get(treeOid);
-    if (!obj || obj.type !== 'tree') return ZERO_OID;
-    const entry = parseTree(obj.data).find((e) => e.name === part && e.mode === '40000');
+    const entry = cachedParseTree(repo, treeOid).find((e) => e.name === part && e.mode === '40000');
     if (!entry) return ZERO_OID;
     treeOid = entry.oid;
   }
@@ -518,8 +512,36 @@ export function createApp(): Server {
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = pathOf(req);
-  const query = queryOf(req);
+
+  // Fast path: GET /api/v3/repos/{owner}/{repo}/issues/{n} (the read benchmark).
+  // Byte-identical to the generic route: same status, headers and cached body.
+  if (method === 'GET') {
+    const fast = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url ?? '');
+    if (fast && !fast[1].includes('%') && !fast[2].includes('%') && authorized(req)) {
+      const repo = store.getRepo(fast[1], fast[2]);
+      const issue = repo?.issueByNumber.get(Number(fast[3]));
+      if (repo && issue) {
+        const buf = issueResponseBuffer(repo, issue);
+        res.writeHead(200, {
+          'content-type': JSON_TYPE,
+          'content-length': buf.length,
+          'x-github-request-id': requestId(),
+        });
+        res.end(buf);
+        return;
+      }
+    }
+  }
+
+  // One URL parse per request (path + query together).
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', 'http://entry');
+  } catch {
+    url = new URL('/', 'http://entry');
+  }
+  const path = url.pathname;
+  const query = url.searchParams;
   const parts = segments(path);
 
   // Health probe: no auth.
@@ -770,7 +792,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, parts: strin
       if (rest[1] === 'trees' && rest.length === 3 && method === 'GET') {
         const obj = repo.objects.get(rest[2]);
         if (!obj || obj.type !== 'tree') return sendError(res, 404, 'Not Found');
-        const tree = parseTree(obj.data).map((e) => ({ path: e.name, mode: e.mode, type: e.mode === '40000' ? 'tree' : 'blob', sha: e.oid, size: e.mode === '40000' ? undefined : repo.objects.get(e.oid)?.data.length, url: `/api/v3/repos/${repo.owner}/${repo.name}/git/${e.mode === '40000' ? 'trees' : 'blobs'}/${e.oid}` }));
+        const tree = cachedParseTree(repo, rest[2]).map((e) => ({ path: e.name, mode: e.mode, type: e.mode === '40000' ? 'tree' : 'blob', sha: e.oid, size: e.mode === '40000' ? undefined : repo.objects.get(e.oid)?.data.length, url: `/api/v3/repos/${repo.owner}/${repo.name}/git/${e.mode === '40000' ? 'trees' : 'blobs'}/${e.oid}` }));
         return sendJson(res, 200, { sha: rest[2], tree });
       }
       if (rest[1] === 'blobs' && rest.length === 3 && method === 'GET') {
@@ -788,7 +810,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, parts: strin
 
     // Contents.
     if (rest[0] === 'contents') {
-      return handleContents(req, res, repo, rest.slice(1), method);
+      return handleContents(req, res, repo, rest.slice(1), method, query);
     }
 
     // Labels.
@@ -879,6 +901,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, parts: strin
           }
           issue.updatedAt = isoNow();
           issue.jsonCache = null;
+          issue.jsonCacheBuf = null;
           return sendJson(res, 200, issueJson(repo, issue));
         }
         return sendError(res, 404, 'Not Found');
