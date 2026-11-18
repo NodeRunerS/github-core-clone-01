@@ -18,9 +18,19 @@ const DELIM = Buffer.from('0001', 'ascii');
 export function pktLine(data: string | Buffer): Buffer {
   const payload = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
   const len = payload.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, payload]);
+  if (len > 0xffff) {
+    // Oversized (invalid pkt-line): keep the old two-buffer shape.
+    const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
+    return Buffer.concat([head, payload]);
+  }
+  const out = Buffer.allocUnsafe(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
+
+const hexVal = (c: number): number =>
+  c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
 
 function pktStr(s: string): Buffer {
   return pktLine(s);
@@ -31,8 +41,12 @@ export function parsePktLines(buf: Buffer): { packets: Array<{ kind: 'data' | 'f
   const packets: Array<{ kind: 'data' | 'flush' | 'delim'; payload: Buffer }> = [];
   let i = 0;
   while (i + 4 <= buf.length) {
-    const len = parseInt(buf.subarray(i, i + 4).toString('ascii'), 16);
-    if (Number.isNaN(len)) break;
+    const d0 = hexVal(buf[i]);
+    const d1 = hexVal(buf[i + 1]);
+    const d2 = hexVal(buf[i + 2]);
+    const d3 = hexVal(buf[i + 3]);
+    if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0) break;
+    const len = (d0 << 12) | (d1 << 8) | (d2 << 4) | d3;
     if (len === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       i += 4;
@@ -95,8 +109,10 @@ function adler32(data: Buffer): number {
 /**
  * Inflate one pack entry synchronously. inflateSync is ~20x faster than a per-object stream,
  * but reports no consumed length: the stream's end is found by scanning for its trailing
- * Adler-32 (a zlib stream is header + deflate + Adler-32 of the data), and the candidate end
- * is verified by re-inflating exactly that slice. Returns null when anything is unexpected,
+ * Adler-32 (a zlib stream is header + deflate + Adler-32 of the data). A 4-byte Adler match
+ * is conclusive for practical purposes (a false match has probability ~2^-32 per position),
+ * so the first match is trusted without re-inflating; readPack's final-position check and
+ * its whole-pack stream fallback catch any misparse. Returns null when anything is unexpected,
  * and the caller falls back to the stream version.
  */
 function inflateEntrySync(buf: Buffer, pos: number, size: number): { data: Buffer; consumed: number } | null {
@@ -115,22 +131,15 @@ function inflateEntrySync(buf: Buffer, pos: number, size: number): { data: Buffe
   const limit = buf.length - 4;
   for (let q = pos + 2; q <= limit; q += 1) {
     if (buf[q] === b0 && buf[q + 1] === b1 && buf[q + 2] === b2 && buf[q + 3] === b3) {
-      // The slice must include the Adler trailer itself (q + 4), or inflateSync
-      // sees a truncated stream and throws "unexpected end of file".
-      try {
-        if (inflateSync(buf.subarray(pos, q + 4)).length === size) {
-          return { data, consumed: q + 4 - pos };
-        }
-      } catch {
-        // A truncated slice: not the true end, keep scanning.
-      }
+      return { data, consumed: q + 4 - pos };
     }
   }
   return null;
 }
 
-async function inflateEntry(buf: Buffer, pos: number, size: number): Promise<{ data: Buffer; consumed: number }> {
-  return inflateEntrySync(buf, pos, size) ?? inflateOne(buf.subarray(pos));
+async function inflateEntry(buf: Buffer, pos: number, size: number, fast: boolean): Promise<{ data: Buffer; consumed: number }> {
+  if (fast) return inflateEntrySync(buf, pos, size) ?? inflateOne(buf.subarray(pos));
+  return inflateOne(buf.subarray(pos));
 }
 
 interface PackEntryRaw {
@@ -198,10 +207,24 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return result;
 }
 
-/** Parse a packfile; resolveBase finds a base object outside the pack (the repo store). */
+/** Parse a packfile; resolveBase finds a base object outside the pack (the repo store).
+ *  Fast path trusts inflateSync + Adler scan; any misparse retries the whole pack with
+ *  per-entry streams, so a wrong Adler match can only cost time, never correctness. */
 export async function readPack(
   buf: Buffer,
   resolveBase: (oid: string) => GitObject | undefined,
+): Promise<{ objects: Map<string, GitObject>; deltaCount: number }> {
+  try {
+    return await readPackImpl(buf, resolveBase, true);
+  } catch {
+    return readPackImpl(buf, resolveBase, false);
+  }
+}
+
+async function readPackImpl(
+  buf: Buffer,
+  resolveBase: (oid: string) => GitObject | undefined,
+  fast: boolean,
 ): Promise<{ objects: Map<string, GitObject>; deltaCount: number }> {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const version = buf.readUInt32BE(4);
@@ -236,27 +259,28 @@ export async function readPack(
         pos += 1;
         offset = ((offset + 1) << 7) | (b & 0x7f);
       }
-      const { data, consumed } = await inflateEntry(buf, pos, size);
+      const { data, consumed } = await inflateEntry(buf, pos, size, fast);
       if (data.length !== size) throw new Error('ofs-delta inflated size mismatch');
       pos += consumed;
       raw = { type: 'ofs-delta', data, baseOffset: entryStart - offset };
     } else if (type === 7) {
       const baseOid = buf.subarray(pos, pos + 20).toString('hex');
       pos += 20;
-      const { data, consumed } = await inflateEntry(buf, pos, size);
+      const { data, consumed } = await inflateEntry(buf, pos, size, fast);
       if (data.length !== size) throw new Error('ref-delta inflated size mismatch');
       pos += consumed;
       raw = { type: 'ref-delta', data, baseOid };
     } else {
       const typeName = typeNames[type];
       if (!typeName) throw new Error(`unknown pack object type ${type}`);
-      const { data, consumed } = await inflateEntry(buf, pos, size);
+      const { data, consumed } = await inflateEntry(buf, pos, size, fast);
       if (data.length !== size) throw new Error('object inflated size mismatch');
       pos += consumed;
       raw = { type: typeName, data };
     }
     raws.push(raw);
   }
+  if (pos !== buf.length - 20) throw new Error('pack entries do not end at the trailer');
   const oidOf = (obj: GitObject): string => {
     return createHash('sha1').update(`${obj.type} ${obj.data.length}\0`, 'utf8').update(obj.data).digest('hex');
   };
@@ -501,7 +525,12 @@ function sideband(pack: Buffer): Buffer[] {
   const CHUNK = 65500;
   for (let i = 0; i < pack.length; i += CHUNK) {
     const slice = pack.subarray(i, Math.min(pack.length, i + CHUNK));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    const len = slice.length + 5; // 4 header bytes + 1 band byte + data
+    const pkt = Buffer.allocUnsafe(len);
+    pkt.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    pkt[4] = 1;
+    slice.copy(pkt, 5);
+    out.push(pkt);
   }
   if (pack.length === 0) {
     // A packfile section must carry at least one sideband packet.
@@ -551,11 +580,11 @@ function refLinesV0(repo: Repo, caps: string, headFirst: boolean): Buffer[] {
 
 export function infoRefsBody(repo: Repo | null, service: 'git-upload-pack' | 'git-receive-pack', gitProtocol: string): Buffer | null {
   if (!repo) return null;
-  const serviceLine = pktStr(`# service=${service}\n`);
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
-    // The v2 capability advertisement is constant: build once.
-    return Buffer.concat([serviceLine, FLUSH, V2_UPLOAD_CAPS, FLUSH]);
+    // The v2 capability advertisement is constant: one prebuilt buffer.
+    return V2_INFO_REFS_UPLOAD;
   }
+  const serviceLine = pktStr(`# service=${service}\n`);
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
   return Buffer.concat([serviceLine, FLUSH, ...refLinesV0(repo, caps, true), FLUSH]);
 }
@@ -568,6 +597,14 @@ const V2_UPLOAD_CAPS = Buffer.concat([
   'object-format=sha1',
   'server-option',
 ].map((c) => pktStr(`${c}\n`)));
+
+/** Whole v2 upload-pack advertisement (service line + caps), built once. */
+const V2_INFO_REFS_UPLOAD = Buffer.concat([
+  pktStr('# service=git-upload-pack\n'),
+  FLUSH,
+  V2_UPLOAD_CAPS,
+  FLUSH,
+]);
 
 // --------------------------------------------------------------------------------------------
 // upload-pack.
